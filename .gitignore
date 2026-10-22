@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────
+#  pi-active-telegram — 추적하면 안 되는 것
+#
+#  추적되는 파일은 이 일곱 개뿐이다 (그 외 전부 아래에 걸린다):
+#    .gitignore  .gitattributes  LICENSE  README.md  package.json
+#    extensions/telegram-steer.ts  notify.py
+#
+#  규칙: 오프셋은 앞쪽으로만 전진한다. 상태 파일을 커밋해서 되돌리면
+#  그 update 는 영구 스킵된다 → 상태는 git 밖에 산다.
+# ─────────────────────────────────────────────────────────────
+
+# ── 비밀 · 절대 커밋 금지 ──────────────────────────────────
+telegram.json
+.env
+.env.*
+*.token
+*.pem
+*.key
+*.p12
+
+# ── 런타임 상태 (오프셋·소유권·중복제거·로그) ───────────────
+# 기계/세션을 다시 켜면 다시 생긴다. 커밋하면 되감기 사고가 난다.
+*_offset.json
+*.claim.json
+notify_state.json
+*.log
+*.bak
+
+# ── 세션 소모품 ───────────────────────────────────────────
+handoff.md
+
+# ── 내부 문서 · 공개하면 안 되는 좌표가 들어있다 ───────────
+# 개인 하드 경로 · 실측 chat_id · 역대 판정.
+# 공개 README 에는 이 내용를 쓰지 않는다. 저장소에 넣으면 깃헙 페이지에 그대로 노출된다.
+AGENTS.md
+* copy.md
+
+# ── Python 바이트코드 · notify.py 를 실행하면 생긴다 ────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Python 가상환경 ───────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Node ─────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# ── 개발 하네스 · 나만 쓴다 (공개 저장소에 넣지 않는다) ──
+tg_tool_test.mjs
+
+# ── 테스트가 만드는 임시물 ────────────────────────────────
+_tg_test_tmp/
+tmp/
+*.tmp
+
+# ── 에디터 · OS ──────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

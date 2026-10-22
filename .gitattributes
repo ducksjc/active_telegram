@@ -1,0 +1,3 @@
+# 저장소는 LF 로 통일한다 (Windows 에서도). 지금 추적되는 6개 파일은 전부 LF 이고,
+# CRLF 였던 tg_tool_test.mjs 는 git 밖(개발 하네스)이라 상관이 없다.
+* text=auto eol=lf
