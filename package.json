@@ -1,7 +1,7 @@
 {
   "name": "pi-active-telegram",
-  "version": "0.2.0",
-  "description": "Two-way Telegram link for pi: phone→agent inbound steering via the telegram_connect tool, agent→phone notifications via notify.py. Single poller, claim-based ownership.",
+  "version": "0.3.0",
+  "description": "Two-way Telegram link for pi: phone→agent inbound steering via the telegram_connect tool, agent→phone notifications via the telegram_notify tool (notify.py remains as the out-of-pi command line). Single poller, claim-based ownership.",
   "license": "MIT",
   "author": "joonchoul.shin",
   "repository": {

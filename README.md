@@ -4,7 +4,8 @@ Two-way Telegram link for [pi](https://github.com/badlogic/pi-mono) coding agent
 
 ```
 phone ──Telegram──▶ telegram-steer.ts ──steer──▶ pi session
-pi session ──notify.py──▶ Telegram ──▶ phone
+pi session ──telegram_notify tool──▶ Telegram ──▶ phone
+(anything outside pi ──notify.py──▶ Telegram ──▶ phone)
 ```
 
 # 작동 방식과 왜 이렇게 만들어 진건지
@@ -22,7 +23,7 @@ ducksjc/active_handoff 와 같이 사용할 때 handoff.md 나 agents.md에 탤�
 | Direction | Mechanism | Trigger |
 |---|---|---|
 | **Inbound** phone → agent | `extensions/telegram-steer.ts` polls `getUpdates` every 2 s and injects the message with `deliverAs: "steer"` | the session calls the `telegram_connect` tool |
-| **Outbound** agent → phone | `notify.py` (plain Python, stdlib only) | you or the agent runs `python notify.py <level> "text"` |
+| **Outbound** agent → phone | the `telegram_notify` tool (same extension, pure TypeScript) — or `notify.py` when you are outside pi | the agent calls the tool; you run `python notify.py <level> "text"` |
 | **Delivery receipt** | the bot replies to your phone with the first 5 characters + `… received` the moment a message actually lands in the session | automatic |
 
 Inbound is *steering*, not a new prompt: the message lands in the middle of the agent's work and redirects it.
@@ -31,7 +32,7 @@ Inbound is *steering*, not a new prompt: the message lands in the middle of the 
 
 - **pi** ≥ 0.x with package support (`pi install`, `pi list`)
 - **Node.js** — the extension runs inside pi's own loader, no build step
-- **Python 3.7+** — `notify.py` uses only the standard library (`urllib`, `json`, `argparse`). No `pip install` needed.
+- **Python 3.7+** — optional, only for the `notify.py` command line. It uses the standard library alone (`urllib`, `json`, `argparse`), no `pip install`. In-session outbound needs no Python at all.
 - Network access to `api.telegram.org`
 
 ## Setup
@@ -102,14 +103,45 @@ telegram_connect
 - Only **one** session is connected at a time. Calling the tool overwrites the claim; the previous poller notices on its next tick and exits cleanly.
 - Connected sessions receive phone messages as:
   ```
-  [telegram 21:14:07 Joon] run the gate suite again
+  [telegram 21:14:07 kim] run the gate suite again
   ```
   (24-hour stamp, sender's first name or username.)
 - The phone gets an instant receipt: `run t… received`.
 - **The connection dies with the session.** No auto-reconnect, no session-id file. After `/new` or `pi --continue`, call the tool again.
 - Unconnected sessions do not poll at all.
 
-### Outbound: notify.py
+### Outbound: the `telegram_notify` tool
+
+Registered by the same extension as `telegram_connect`. **It works whether or not the session is connected** — sending never touches the poller, so it cannot provoke `409`.
+
+```
+telegram_notify { "level": "milestone", "message": "gate suite 57/57 PASS" }
+telegram_notify { "level": "bench",    "message": "wall 18.4s", "file": "C:/logs/bench.txt", "note": "bench log" }
+telegram_notify { "level": "abort",    "message": "load failed 3x", "force": true }
+```
+
+| Parameter | Meaning |
+|---|---|
+| `level` | `milestone` `bench` `fail` `abort` `info` `ok` (default `info`). `fail`/`abort` bypass the 60 s duplicate guard. |
+| `message` | one sentence of body text |
+| `file` | path of a file to attach |
+| `note` | caption for an image; for any other file it becomes the message body |
+| `force` | send even if the identical sentence went out within 60 s |
+
+The tool always answers with what actually left, so nothing fails silently:
+
+```
+sent [milestone] "gate suite 57/57 PASS" → message_id 914
+text NOT sent — the identical sentence went out 12s ago (60s guard). pass force:true to send it again
+attached sendDocument build.log (240KB) message_id 915
+sendDocument has no caption — the note went as a separate message below
+```
+
+A bad `level`, a missing `level`, or an invented parameter name is repaired instead of rejected, and the reply shows which level was really used. A missing file or a missing `chat_id` returns an error result naming the fix.
+
+### Outbound outside pi: notify.py
+
+The command line is the same channel (same `telegram.json`, same dedup state file), for cron jobs, other agents, or your own shell:
 
 ```bash
 python notify.py milestone "gate suite 57/57 PASS"
@@ -133,7 +165,7 @@ python notify.py --help
 | `fail` | `⚠️ [fail] …` | **always sent** |
 | `abort` | `⛔ [abort] …` | **always sent** |
 
-Attachments use `sendPhoto` for images and `sendDocument` for everything else (`sendDocument` + caption is rejected with 400 by Telegram — captions go in `--note` as part of the text).
+Attachments use `sendPhoto` for images and `sendDocument` for everything else (`sendDocument` + caption is rejected with 400 by Telegram — captions go in `--note` as part of the text). The tool does the same, but for a non-image it sends the note as a separate message instead of dropping it.
 
 ## Configuration
 
@@ -156,7 +188,7 @@ State lives next to `telegram.json` and is gitignored. Both sides read the **sam
 | `telegram.json` | you | secret: bot token + `chat_id` |
 | `telegram_offset.json` | extension, `notify.py --poll` | highest `update_id` already consumed |
 | `telegram.claim.json` | whoever polls | ownership heartbeat: `{inst, pid, ts}` |
-| `notify_state.json` | `notify.py` | dedup memory (1 h window) |
+| `notify_state.json` | `telegram_notify` tool, `notify.py` | dedup memory (1 h window, shared: both sides see each other's sentences) |
 | `telegram_poll.log` | extension | verdict log — survives the session dying |
 
 **Offsets only ever move forward** (`Math.max`). Restoring an older offset file means those updates are skipped forever.
@@ -167,6 +199,8 @@ State lives next to `telegram.json` and is gitignored. Both sides read the **sam
 - **Ownership is re-read every tick**, never captured as a loop parameter — a captured owner makes takeover silently dead.
 - **Stale messages are discarded, not injected.** A message older than 4 s at fetch time was sent while this pi was not connected; it is logged as `DISCARD` and the offset advances.
 - **The loop is a raw async loop, not an event handler**, so it outlives the extension launcher that pi invalidates on session switch. That is why the claim heartbeat and the log file exist: they are the only honest liveness signals.
+- **One extension, two tools.** Inbound and outbound share the config lookup, the state directory and the poller singleton. Splitting them into two files would create two module scopes, i.e. a real risk of two pollers in one process (`409`). Outbound deliberately never reads or writes `telegram.claim.json` / `telegram_offset.json`.
+- **Outbound is a tool, not a shell command.** Shelling out to a script costs the agent seven recurring mistakes: quoting and non-ASCII mangling, a missing positional, a typo'd level silently downgraded, dedup swallowing the send with exit code 0, a caption silently dropped, the config file not found because the working directory was wrong, and the `python`/`py` launcher. Typed parameters remove five of them outright; the remaining two are reported in the tool result instead of being silent.
 
 ## Known limitations
 
@@ -174,6 +208,8 @@ State lives next to `telegram.json` and is gitignored. Both sides read the **sam
 - `/reload` leaves the old runtime's timers alive. Prefer restarting pi once when you change the extension.
 - Only messages from `chat_id` are accepted; a second person messaging the bot is ignored by design.
 - The test harness cannot simulate `/reload` (the module is evaluated once), so it covers `/new` only.
+- Bootstrapping `chat_id` (`--discover`) is still command line only; the tool tells you to run it when `chat_id` is missing.
+- An image larger than 10 MB is sent as a plain document (Telegram's `sendPhoto` limit), so it loses its caption. Files above 50 MB are refused with a message rather than a `400`.
 
 ## Troubleshooting
 
@@ -186,11 +222,13 @@ State lives next to `telegram.json` and is gitignored. Both sides read the **sam
 | tool says `telegram config file (telegram.json) not found` | no config found in the search path | create it (step 3) or set `ITP_TG_CONF` |
 | phone messages never arrive | session not connected / connection died with the session | call `telegram_connect` again |
 | is the poller alive? | — | `cat telegram.claim.json` and compare `ts` to now; fresh within 8 s means alive |
-| outbound only is broken | — | `python notify.py --test` |
+| outbound only is broken | — | `python notify.py --test` (outside pi) or `telegram_notify {"level":"ok","message":"ping"}` (inside pi) |
+| the tool says `text NOT sent … (60s guard)` | not an error: the identical sentence already went out | re-send with `force: true` if you really mean it |
+| `telegram_notify` is not in the tool list | the extension changed after pi started | restart pi once (`/reload` leaves old timers alive) |
 
 ## Tests
 
-The development harness (`tg_tool_test.mjs`, 13 assertions) is a dev tool, not part of the package, so it is not shipped here. It drives the extension against a fake `fetch` and a fake pi runtime — no network, no real state touched — and asserts: unconnected sessions poll zero · tool call → injection · backlog older than 4 s is discarded · discards produce no receipt · injection produces exactly one receipt · offset advances · lost claim ends the loop · no auto-reconnect after shutdown · re-connect works · own claim is released.
+The development harness (`tg_tool_test.mjs`, 30 assertions) is a dev tool, not part of the package, so it is not shipped here. It drives the extension against a fake `fetch` and a fake pi runtime — no network, no real state touched — and asserts, for inbound: unconnected sessions poll zero · tool call → injection · backlog older than 4 s is discarded · discards produce no receipt · injection produces exactly one receipt · offset advances · lost claim ends the loop · no auto-reconnect after shutdown · re-connect works · own claim is released. And for outbound: sending works with no connection and no claim · dedup skips **and says so** · `force` and `fail`/`abort` bypass it · a bad level is repaired visibly · unknown parameters are dropped · an empty call and a missing file return an error result · images go as `sendPhoto` with `chat_id` and a caption · non-images go as `sendDocument` without a caption and their note becomes a message · a missing `chat_id` names the fix.
 
 Smoke-test what you do have:
 

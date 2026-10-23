@@ -1,6 +1,13 @@
 /**
  * telegram-steer.ts — 텔레그램 연결은 **툴콜로만** 켠다 (2026-10-21 새 규정).
  *
+ * 이 확장 하나가 툴을 둘 등록한다 (2026-10-23):
+ *   · telegram_connect  = 수신 (폰 → pi). poller 는 프로세스 싱글톤 하나.
+ *   · telegram_notify   = 발신 (pi → 폰). notify.py 의 TS 이식. shell 을 중간에서 제거한다.
+ * 파일을 나누지 **않는** 이유: findConf/dir()/claim 이 모듈 스코프 싱글톤 P 에 붙어있다. 둘로 나누면
+ * 모듈 스코프가 두 개가 되어 **P(=poller 상태)가 복제될 여지**가 생긴다 = 409 의 재발.
+ * 발신은 claim/offset 을 전혀 건드리지 않는다(sendMessage 는 poller 와 경합하지 않는다).
+ *
  *   세션이 `telegram_connect` 툴(인자 없음)을 부르면:
  *     1. 기존 연결 전부 해제 — claim 파일을 내 inst로 무조건 덮어쓴다.
  *        다른 프로세스의 옛 poller는 다음 틱에 claim 상실을 감지하고 루프를 영구 종료한다.
@@ -115,16 +122,152 @@ function releaseClaim() {
 	} catch {}
 }
 
+// ── 발신 (pi → 폰) ──────────────────────────────────────────────────────────
+// notify.py 의 TS 이식 (2026-10-23). shell 을 중간에서 없애면 실패 모드 7종이 줄어든다:
+//   ① 따옴표/한글/`&` 깨짐 ② level 자리 누락 ③ level 오타의 조용한 강등 ④ dedup 무음(rc 0)
+//   ⑤ 캡션 조용히 폐기 ⑥ telegram.json 못 찾음 ⑦ python 런처(python vs py)
+// ①②⑥⑦ 은 파라미터 타입과 절대 경로 해석으로 원천 소멸, ③④⑤ 는 **결과 문자열에 명시**해서 없앤다.
+// ★ 발신은 claim/offset 을 건드리지 않는다. 연결되지 않은 세션도 발신만은 할 수 있다.
+const ICON: Record<string, string> = { milestone: "✅", bench: "📊", fail: "⚠️", abort: "⛔", info: "•", ok: "👌" };
+const LEVELS = Object.keys(ICON) as ("milestone" | "bench" | "fail" | "abort" | "info" | "ok")[];
+const DEDUP_S = 60; // notify.py 와 같은 창·같은 키(본문 문자열)·같은 파일 → 두 구현이 서로의 dedup 을 본다
+const STATE_TTL_S = 3600;
+const PHOTO_MAX = 10 * 1024 * 1024; // sendPhoto 한도. 넘기면 sendDocument 로 내린다(그쪽엔 캡션이 없다).
+const DOC_MAX = 50 * 1024 * 1024; // Bot API 파일 한도
+const IMAGE_EXT = /\.(png|jpe?g|webp|gif)$/i;
+const stateFile = () => path.join(dir(), "notify_state.json");
+
+// 연결 없이도 발신한다: conf 경로는 여기서 처음 확정한다 (dir() = 상태 파일 폴더).
+function ensureConf(): any | null {
+	if (!P.confPath) P.confPath = findConf();
+	if (!P.confPath) return null;
+	const j = readJson(P.confPath);
+	return j?.token ? j : null;
+}
+
+const apiErr = (r: any) => `${r?.error_code ?? "?"} ${r?.description ?? ""}`.trim();
+const kb = (n: number) => `${(n / 1024).toFixed(0)}KB`;
+const mb = (n: number) => `${(n / 1048576).toFixed(1)}MB`;
+
+// sendMessage 본문. 실패해도 던지지 않고 {ok, detail} 로 돌려준다(통보 실패로 세션을 죽이지 않는다).
+async function tgSendText(conf: any, text: string): Promise<{ ok: boolean; id?: number; detail: string }> {
+	let r: any;
+	try {
+		const resp = await fetch(`https://api.telegram.org/bot${conf.token}/sendMessage`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ chat_id: conf.chat_id, text, disable_web_page_preview: true }),
+			signal: AbortSignal.timeout(25000),
+		});
+		r = await resp.json();
+	} catch (e: any) {
+		return { ok: false, detail: `fetch ${String(e?.message || e)}` };
+	}
+	if (!r?.ok) return { ok: false, detail: apiErr(r) };
+	return { ok: true, id: r.result?.message_id, detail: `message_id ${r.result?.message_id}` };
+}
+
 // 생존신고는 폰으로 (봇 토큰은 이미 가지고 있다). 실패해도 조용히 무시(통보 실패로 poll은 죽이지 않는다).
 async function notifyPhone(conf: any, text: string) {
 	try {
-		await fetch(`https://api.telegram.org/bot${conf.token}/sendMessage`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ chat_id: conf.chat_id, text }),
-		});
+		await tgSendText(conf, text);
 	} catch {}
 }
+
+function mimeOf(name: string): string {
+	const e = path.extname(name).toLowerCase();
+	const m: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
+	return m[e] || "application/octet-stream";
+}
+
+// 첨부: 이미지는 sendPhoto(캡션 지원), 그 외는 sendDocument.
+// 함정(실측): sendDocument 에 caption 을 넣으면 400. chat_id 는 multipart 필드로 필수(없으면 400 "chat_id is empty").
+async function tgSendFile(
+	conf: any,
+	file: string,
+	caption: string | null,
+): Promise<{ ok: boolean; id?: number; method?: string; bytes?: number; detail: string }> {
+	let size = -1;
+	try {
+		size = fs.statSync(file).size;
+	} catch {
+		return { ok: false, detail: `no such file: ${file}` };
+	}
+	const name = path.basename(file);
+	const photo = IMAGE_EXT.test(name) && size <= PHOTO_MAX;
+	if (size > DOC_MAX) return { ok: false, detail: `${name} is ${mb(size)} — over the 50MB Bot API limit` };
+	const method = photo ? "sendPhoto" : "sendDocument";
+	const field = photo ? "photo" : "document";
+	const B = `----pi-tg-${randomUUID().slice(0, 8)}`;
+	const fd = (k: string, v: string) => Buffer.from(`--${B}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`, "utf-8");
+	const parts: Buffer[] = [fd("chat_id", String(conf.chat_id))]; // ← 필수로 넣어야 한다(위 함정)
+	if (photo && caption) parts.push(fd("caption", caption));
+	parts.push(
+		Buffer.from(`--${B}\r\nContent-Disposition: form-data; name="${field}"; filename="${name}"\r\nContent-Type: ${mimeOf(name)}\r\n\r\n`, "utf-8"),
+	);
+	parts.push(fs.readFileSync(file));
+	parts.push(Buffer.from(`\r\n--${B}--\r\n`, "utf-8"));
+	let r: any;
+	try {
+		const resp = await fetch(`https://api.telegram.org/bot${conf.token}/${method}`, {
+			method: "POST",
+			headers: { "Content-Type": `multipart/form-data; boundary=${B}` },
+			body: Buffer.concat(parts),
+			signal: AbortSignal.timeout(120000),
+		});
+		r = await resp.json();
+	} catch (e: any) {
+		return { ok: false, detail: `fetch ${String(e?.message || e)}` };
+	}
+	if (!r?.ok) return { ok: false, detail: apiErr(r) };
+	return { ok: true, id: r.result?.message_id, method, bytes: size, detail: `${method} ${name} (${kb(size)}) message_id ${r.result?.message_id}` };
+}
+
+// 본문 문자열은 notify.py 와 **바이트 단위로 동일**해야 dedup 이 서로 통한다.
+const bodyText = (level: string, msg: string) => (level === "info" ? `${ICON.info} ${msg}` : `${ICON[level]} [${level}] ${msg}`);
+
+// 60초 안 같은 문장은 생략(spam 방지). fail/abort 는 항상 보낸다. 스킨 때는 **반드시 알린다**(④ 제거).
+function dedup(text: string, level: string, force?: boolean): { skip: boolean; ageS?: number } {
+	const now = Date.now() / 1000;
+	let seen: Record<string, number> = {};
+	try {
+		const j = JSON.parse(fs.readFileSync(stateFile(), "utf-8"));
+		if (j && typeof j === "object") seen = j;
+	} catch {}
+	const prev = Number(seen[text] || 0);
+	if (!force && level !== "fail" && level !== "abort" && now - prev < DEDUP_S) return { skip: true, ageS: Math.round(now - prev) };
+	seen[text] = now;
+	for (const k of Object.keys(seen)) if (now - Number(seen[k] || 0) > STATE_TTL_S) delete seen[k];
+	try {
+		fs.writeFileSync(stateFile(), JSON.stringify(seen));
+	} catch {}
+	return { skip: false };
+}
+
+// level 을 빠뜨리거나 오타내면 여기서 고쳐준다 — 스키마가 통째로 거부되면 에이전트가 한 턱을 더 쓴다.
+// 알려지지 않은 키는 버린다(없는 인자를 지어내는 실수도 여기서 막힌다). ②③ 제거.
+function fixNotifyArgs(raw: unknown) {
+	const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+	const s = (v: unknown) => (typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : undefined);
+	const a: Record<string, unknown> = {};
+	const msg = s(src.message);
+	const file = s(src.file);
+	const note = s(src.note);
+	let level = s(src.level);
+	if (level !== undefined && !(level in ICON)) {
+		// level 자리로 메시지 한 줄만 들어온 경우 (notify.py 의 구조 구제와 동일) + 오타는 info 로 강등.
+		if (msg === undefined && file === undefined) a.message = level;
+		level = "info";
+	}
+	if (msg !== undefined) a.message = msg;
+	if (file !== undefined) a.file = file;
+	if (note !== undefined) a.note = note;
+	if (level !== undefined) a.level = level;
+	if (src.force !== undefined) a.force = !!src.force;
+	return a;
+}
+
+const errResult = (text: string) => ({ content: [{ type: "text" as const, text }], details: { error: text }, isError: true });
 
 async function tickOnce(self: Owner) {
 	const conf = readJson(P.confPath || "");
@@ -265,6 +408,91 @@ export default function (pi: ExtensionAPI) {
 			const ok = connect({ pi, ctx }, INSTANCE);
 			const text = ok ? statusLine() : "telegram config file (telegram.json) not found";
 			return { content: [{ type: "text", text }], details: { connected: ok, status: text } };
+		},
+	});
+
+	pi.registerTool({
+		name: "telegram_notify",
+		label: "Telegram notify",
+		description:
+			"Send a sentence and/or a file from pi to the user's phone over Telegram. Works whether or not this session is connected (sending never touches the poller). level picks the icon/prefix; fail and abort always send, the other levels are skipped when the identical sentence was sent within 60s (pass force to override) — a skip is always reported, never silent. Attachments: png/jpg/webp/gif go as photos and note (or message) becomes the caption; any other file goes as a document, which has no caption, so its text is sent as a separate message. The result states exactly what went out.",
+		promptSnippet: "telegram_notify — send progress notes and files to the user's phone (pi→Telegram outbound)",
+		promptGuidelines: ["Anything that must reach the user's phone goes through telegram_notify, never through a shell call to notify.py."],
+		parameters: Type.Object({
+			level: Type.Optional(
+				Type.Union(LEVELS.map((l) => Type.Literal(l)), {
+					description: "milestone | bench | fail | abort | info | ok (default info). fail/abort bypass the 60s duplicate guard.",
+				}),
+			),
+			message: Type.Optional(Type.String({ description: "one sentence of body text (English recommended)" })),
+			file: Type.Optional(Type.String({ description: "path of a file to attach (absolute path is safest)" })),
+			note: Type.Optional(Type.String({ description: "caption for an image attachment; for other files it becomes the message body" })),
+			force: Type.Optional(Type.Boolean({ description: "send even if the identical sentence went out within 60s" })),
+		}),
+		prepareArguments: fixNotifyArgs,
+		execute: async (_toolCallId, args, _signal, _onUpdate, ctx) => {
+			const conf = ensureConf();
+			if (!conf) return errResult(`telegram.json not found — looked at: ${CANDIDATES.join(" | ")}`);
+			if (conf.chat_id === undefined || conf.chat_id === null)
+				return errResult(`chat_id is missing in ${P.confPath} — send any message to the bot, then run: python notify.py --discover`);
+
+			const level = (args.level as string) || "info";
+			const msg = (args.message || "").trim();
+			const file = (args.file || "").trim();
+			const note = (args.note || "").trim();
+			if (!msg && !file && !note) return errResult("nothing to send — give message and/or file");
+
+			const out: string[] = [];
+			// details 는 모델에게 안 가지만 세션 기록/HTML export 에 남는다 → chat_id 는 넣지 않는다 (message_id 로 충분).
+			const det: any = { level };
+			let failed = false;
+
+			// 첨부 먼저 보낸다(첨부가 죽으면 본문도 보내지 않고 알려준다 — 반쪽 성공의 조용한 성공 금지).
+			// 이미지가 아니면 캡션 자리가 없으므로 본문을 **별도 메시지로** 보낸다(⑤ 제거).
+			let body: string | null = msg || null;
+			if (file) {
+				const isImg = IMAGE_EXT.test(path.basename(file));
+				const caption = isImg ? note || msg || null : null;
+				const r = await tgSendFile(conf, file, caption);
+				if (!r.ok) {
+					log(`SEND-ERR file ${file} — ${r.detail}`);
+					return errResult(`attach failed — ${r.detail}`);
+				}
+				det.attach = { file, method: r.method, bytes: r.bytes, message_id: r.id, caption: caption || null };
+				out.push(`attached ${r.detail}${caption ? ` (caption: "${caption.slice(0, 40)}")` : ""}`);
+				if (isImg) body = note && msg ? msg : null; // 캡션은 note 가 먹었다. message 도 따로 있으면 본문으로 보낸다.
+				else {
+					body = msg || note || null;
+					if (note) out.push("sendDocument has no caption — the note went as a separate message below");
+				}
+			}
+
+			if (body) {
+				const text = bodyText(level, body);
+				const d = dedup(text, level, args.force);
+				if (d.skip) {
+					det.deduped = true;
+					out.push(`text NOT sent — the identical sentence went out ${d.ageS}s ago (60s guard). pass force:true to send it again`);
+				} else {
+					const r = await tgSendText(conf, text);
+					if (!r.ok) {
+						failed = true;
+						log(`SEND-ERR [${level}] ${r.detail}`);
+						out.push(`text NOT sent — sendMessage failed: ${r.detail}`);
+					} else {
+						det.text_message_id = r.id;
+						out.push(`sent [${level}] "${body}" → ${r.detail}`);
+						log(`SEND ok [${level}] "${body.slice(0, 60)}"`);
+					}
+				}
+			}
+			if (det.deduped) log(`SEND dedup [${level}] "${(body || "").slice(0, 60)}"`);
+
+			const text = out.join("\n");
+			try {
+				if (ctx?.hasUI) ctx.ui.notify(det.attach ? `→ phone: ${det.attach.method}` : `→ phone: [${level}]`, failed ? "error" : "info");
+			} catch {}
+			return { content: [{ type: "text" as const, text }], details: det, isError: failed || undefined };
 		},
 	});
 
