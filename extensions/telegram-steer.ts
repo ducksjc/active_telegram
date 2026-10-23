@@ -128,7 +128,7 @@ function releaseClaim() {
 //   ⑤ 캡션 조용히 폐기 ⑥ telegram.json 못 찾음 ⑦ python 런처(python vs py)
 // ①②⑥⑦ 은 파라미터 타입과 절대 경로 해석으로 원천 소멸, ③④⑤ 는 **결과 문자열에 명시**해서 없앤다.
 // ★ 발신은 claim/offset 을 건드리지 않는다. 연결되지 않은 세션도 발신만은 할 수 있다.
-const ICON: Record<string, string> = { milestone: "✅", bench: "📊", fail: "⚠️", abort: "⛔", info: "•", ok: "👌" };
+const ICON: Record<string, string> = { milestone: "✅", bench: "📊", fail: "⚠️", abort: "⛔", info: "", ok: "👌" };
 const LEVELS = Object.keys(ICON) as ("milestone" | "bench" | "fail" | "abort" | "info" | "ok")[];
 const DEDUP_S = 60; // notify.py 와 같은 창·같은 키(본문 문자열)·같은 파일 → 두 구현이 서로의 dedup 을 본다
 const STATE_TTL_S = 3600;
@@ -224,7 +224,8 @@ async function tgSendFile(
 }
 
 // 본문 문자열은 notify.py 와 **바이트 단위로 동일**해야 dedup 이 서로 통한다.
-const bodyText = (level: string, msg: string) => (level === "info" ? `${ICON.info} ${msg}` : `${ICON[level]} [${level}] ${msg}`);
+// info 는 접두사를 붙이지 않는다 — LLM 이 쓴 문자 그대로 나간다 (2026-10-23 user 결정).
+const bodyText = (level: string, msg: string) => (level === "info" ? msg : `${ICON[level]} [${level}] ${msg}`);
 
 // 60초 안 같은 문장은 생략(spam 방지). fail/abort 는 항상 보낸다. 스킨 때는 **반드시 알린다**(④ 제거).
 function dedup(text: string, level: string, force?: boolean): { skip: boolean; ageS?: number } {
@@ -415,7 +416,7 @@ export default function (pi: ExtensionAPI) {
 		name: "telegram_notify",
 		label: "Telegram notify",
 		description:
-			"Send a sentence and/or a file from pi to the user's phone over Telegram. Works whether or not this session is connected (sending never touches the poller). level picks the icon/prefix; fail and abort always send, the other levels are skipped when the identical sentence was sent within 60s (pass force to override) — a skip is always reported, never silent. Attachments: png/jpg/webp/gif go as photos and note (or message) becomes the caption; any other file goes as a document, which has no caption, so its text is sent as a separate message. The result states exactly what went out.",
+			"Send a sentence and/or a file from pi to the user's phone over Telegram. Works whether or not this session is connected (sending never touches the poller). level picks the icon/prefix; level info sends the text exactly as written, with no prefix. fail and abort always send, the other levels are skipped when the identical sentence was sent within 60s (pass force to override) — a skip is always reported, never silent. Attachments: png/jpg/webp/gif go as photos and note (or message) becomes the caption; any other file goes as a document, which has no caption, so its text is sent as a separate message. The result states exactly what went out.",
 		promptSnippet: "telegram_notify — send progress notes and files to the user's phone (pi→Telegram outbound)",
 		promptGuidelines: ["Anything that must reach the user's phone goes through telegram_notify, never through a shell call to notify.py."],
 		parameters: Type.Object({

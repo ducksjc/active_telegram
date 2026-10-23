@@ -42,7 +42,7 @@ try:    # 콘솔이 cp949 라 한글이 깨진다(함정). stdout 을 UTF-8 로 
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-ICON = {"milestone": "✅", "bench": "📊", "fail": "⚠️", "abort": "⛔", "info": "•", "ok": "👌"}
+ICON = {"milestone": "✅", "bench": "📊", "fail": "⚠️", "abort": "⛔", "info": "", "ok": "👌"}
 STATE = CONF.parent / "notify_state.json"   # 런마다 새로 뜨는 프로세스라 중복 제거는 파일로 해야 실제로 작동한다
 OFFSET = CONF.parent / "notify_offset.json"  # 읽은 update_id. 이게 없으면 예전 메시지를 매번 다시 읽는다
 
@@ -278,7 +278,8 @@ def main() -> int:
     lvl = a.level if a.level in ICON else "info"
     if lvl == "info" and a.level not in ICON:      # notify.py "메시지" 만 준 경우
         a.message = f"{a.level}"
-    text = f"{ICON[lvl]} [{lvl}] {a.message}" if lvl != "info" else f"{ICON['info']} {a.message}"
+    # info 는 접두사 없이 — LLM 이 쓴 문자 그대로 보낸다 (2026-10-23 user 결정 · 확장 쪽과 같은 포맷이어야 dedup 이 서로 통한다)
+    text = f"{a.message}" if lvl == "info" else f"{ICON[lvl]} [{lvl}] {a.message}"
 
     key = text
     now = time.time()

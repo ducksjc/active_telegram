@@ -160,7 +160,7 @@ python notify.py --help
 |---|---|---|
 | `milestone` | `✅ [milestone] …` | skipped if the identical sentence was sent within 60 s |
 | `bench` | `📊 [bench] …` | same |
-| `info` | `• …` | same |
+| `info` | the text exactly as written — **no prefix** | same |
 | `ok` | `👌 [ok] …` | same |
 | `fail` | `⚠️ [fail] …` | **always sent** |
 | `abort` | `⛔ [abort] …` | **always sent** |
@@ -228,7 +228,7 @@ State lives next to `telegram.json` and is gitignored. Both sides read the **sam
 
 ## Tests
 
-The development harness (`tg_tool_test.mjs`, 30 assertions) is a dev tool, not part of the package, so it is not shipped here. It drives the extension against a fake `fetch` and a fake pi runtime — no network, no real state touched — and asserts, for inbound: unconnected sessions poll zero · tool call → injection · backlog older than 4 s is discarded · discards produce no receipt · injection produces exactly one receipt · offset advances · lost claim ends the loop · no auto-reconnect after shutdown · re-connect works · own claim is released. And for outbound: sending works with no connection and no claim · dedup skips **and says so** · `force` and `fail`/`abort` bypass it · a bad level is repaired visibly · unknown parameters are dropped · an empty call and a missing file return an error result · images go as `sendPhoto` with `chat_id` and a caption · non-images go as `sendDocument` without a caption and their note becomes a message · a missing `chat_id` names the fix.
+The development harness (`tg_tool_test.mjs`, 31 assertions) is a dev tool, not part of the package, so it is not shipped here. It drives the extension against a fake `fetch` and a fake pi runtime — no network, no real state touched — and asserts, for inbound: unconnected sessions poll zero · tool call → injection · backlog older than 4 s is discarded · discards produce no receipt · injection produces exactly one receipt · offset advances · lost claim ends the loop · no auto-reconnect after shutdown · re-connect works · own claim is released. And for outbound: sending works with no connection and no claim · dedup skips **and says so** · `force` and `fail`/`abort` bypass it · a bad level is repaired visibly · **level `info` sends the raw text with no prefix** · unknown parameters are dropped · an empty call and a missing file return an error result · images go as `sendPhoto` with `chat_id` and a caption · non-images go as `sendDocument` without a caption and their note becomes a message · a missing `chat_id` names the fix.
 
 Smoke-test what you do have:
 
